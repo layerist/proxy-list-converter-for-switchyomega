@@ -1,22 +1,22 @@
 import json
 
 def load_proxies(input_file):
+    """Load proxies from a file and return a list of proxies."""
     try:
         with open(input_file, 'r') as file:
-            proxies = file.readlines()
-        return proxies
+            return [line.strip() for line in file.readlines()]
     except FileNotFoundError:
-        print(f"Error: The file {input_file} was not found.")
+        print(f"Error: The file '{input_file}' was not found.")
         return []
     except Exception as e:
         print(f"An error occurred while reading the file: {e}")
         return []
 
 def create_proxy_data(ip, port, username, password, index):
-    proxy_num = f"+m{index+1}"
-    proxy_data = {
+    """Create a dictionary representing the proxy configuration."""
+    return {
         "profileType": "FixedProfile",
-        "name": proxy_num,
+        "name": f"+m{index+1}",
         "bypassList": [
             {"conditionType": "BypassCondition", "pattern": "127.0.0.1"},
             {"conditionType": "BypassCondition", "pattern": "[::1]"},
@@ -36,9 +36,9 @@ def create_proxy_data(ip, port, username, password, index):
             }
         }
     }
-    return proxy_num, proxy_data
 
 def generate_output_data(proxies):
+    """Generate the final output data structure."""
     output_data = {
         "+auto switch": {
             "color": "#99dd99",
@@ -95,30 +95,32 @@ def generate_output_data(proxies):
 
     for index, proxy in enumerate(proxies):
         try:
-            ip, port, username, password = proxy.strip().split(':')
-            proxy_num, proxy_data = create_proxy_data(ip, port, username, password, index)
-            output_data[proxy_num] = proxy_data
+            ip, port, username, password = proxy.split(':')
+            proxy_data = create_proxy_data(ip, port, username, password, index)
+            output_data[proxy_data["name"]] = proxy_data
         except ValueError:
-            print(f"Error: The proxy '{proxy.strip()}' is not in the correct format.")
-            continue
+            print(f"Error: The proxy '{proxy}' is not in the correct format. Skipping.")
 
     return output_data
 
 def write_output_file(output_data, output_file):
+    """Write the output data to a JSON file."""
     try:
         with open(output_file, 'w') as file:
             json.dump(output_data, file, indent=4)
-        print(f"Output written to {output_file}")
+        print(f"Output successfully written to '{output_file}'")
     except Exception as e:
         print(f"An error occurred while writing the file: {e}")
 
 def convert_proxy_list(input_file, output_file):
+    """Convert a list of proxies from a text file into a JSON configuration."""
     proxies = load_proxies(input_file)
     if proxies:
         output_data = generate_output_data(proxies)
         write_output_file(output_data, output_file)
 
 # Usage
-input_file = 'proxy_list.txt'  # Replace with your input file name
-output_file = 'output.json'  # Replace with your desired output file name
-convert_proxy_list(input_file, output_file)
+if __name__ == "__main__":
+    input_file = 'proxy_list.txt'  # Replace with your input file name
+    output_file = 'output.json'  # Replace with your desired output file name
+    convert_proxy_list(input_file, output_file)
