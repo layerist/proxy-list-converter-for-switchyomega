@@ -4,19 +4,19 @@ def load_proxies(input_file):
     """Load proxies from a file and return a list of proxies."""
     try:
         with open(input_file, 'r') as file:
-            return [line.strip() for line in file.readlines()]
+            return [line.strip() for line in file if line.strip()]
     except FileNotFoundError:
-        print(f"Error: The file '{input_file}' was not found.")
+        print(f"Error: File '{input_file}' not found.")
         return []
     except Exception as e:
-        print(f"An error occurred while reading the file: {e}")
+        print(f"Error reading the file: {e}")
         return []
 
 def create_proxy_data(ip, port, username, password, index):
     """Create a dictionary representing the proxy configuration."""
     return {
         "profileType": "FixedProfile",
-        "name": f"+m{index+1}",
+        "name": f"+m{index + 1}",
         "bypassList": [
             {"conditionType": "BypassCondition", "pattern": "127.0.0.1"},
             {"conditionType": "BypassCondition", "pattern": "[::1]"},
@@ -26,8 +26,8 @@ def create_proxy_data(ip, port, username, password, index):
         "revision": "190a4bca575",
         "fallbackProxy": {
             "scheme": "http",
-            "port": int(port),
-            "host": ip
+            "host": ip,
+            "port": int(port)
         },
         "auth": {
             "fallbackProxy": {
@@ -99,7 +99,7 @@ def generate_output_data(proxies):
             proxy_data = create_proxy_data(ip, port, username, password, index)
             output_data[proxy_data["name"]] = proxy_data
         except ValueError:
-            print(f"Error: The proxy '{proxy}' is not in the correct format. Skipping.")
+            print(f"Error: Proxy '{proxy}' is incorrectly formatted. Skipping.")
 
     return output_data
 
@@ -110,7 +110,7 @@ def write_output_file(output_data, output_file):
             json.dump(output_data, file, indent=4)
         print(f"Output successfully written to '{output_file}'")
     except Exception as e:
-        print(f"An error occurred while writing the file: {e}")
+        print(f"Error writing to the file: {e}")
 
 def convert_proxy_list(input_file, output_file):
     """Convert a list of proxies from a text file into a JSON configuration."""
@@ -122,5 +122,5 @@ def convert_proxy_list(input_file, output_file):
 # Usage
 if __name__ == "__main__":
     input_file = 'proxy_list.txt'  # Replace with your input file name
-    output_file = 'output.json'  # Replace with your desired output file name
+    output_file = 'output.json'    # Replace with your desired output file name
     convert_proxy_list(input_file, output_file)
