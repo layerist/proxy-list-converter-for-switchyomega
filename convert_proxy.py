@@ -7,10 +7,9 @@ def load_proxies(input_file):
             return [line.strip() for line in file if line.strip()]
     except FileNotFoundError:
         print(f"Error: File '{input_file}' not found.")
-        return []
     except Exception as e:
         print(f"Error reading the file: {e}")
-        return []
+    return []
 
 def create_proxy_data(ip, port, username, password, index):
     """Create a dictionary representing the proxy configuration."""
@@ -18,9 +17,8 @@ def create_proxy_data(ip, port, username, password, index):
         "profileType": "FixedProfile",
         "name": f"+m{index + 1}",
         "bypassList": [
-            {"conditionType": "BypassCondition", "pattern": "127.0.0.1"},
-            {"conditionType": "BypassCondition", "pattern": "[::1]"},
-            {"conditionType": "BypassCondition", "pattern": "localhost"}
+            {"conditionType": "BypassCondition", "pattern": pattern}
+            for pattern in ["127.0.0.1", "[::1]", "localhost"]
         ],
         "color": "#ca0",
         "revision": "190a4bca575",
@@ -65,9 +63,8 @@ def generate_output_data(proxies):
         "+proxy": {
             "auth": {},
             "bypassList": [
-                {"conditionType": "BypassCondition", "pattern": "127.0.0.1"},
-                {"conditionType": "BypassCondition", "pattern": "::1"},
-                {"conditionType": "BypassCondition", "pattern": "localhost"}
+                {"conditionType": "BypassCondition", "pattern": pattern}
+                for pattern in ["127.0.0.1", "::1", "localhost"]
             ],
             "color": "#99ccee",
             "fallbackProxy": {
