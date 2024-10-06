@@ -7,9 +7,10 @@ def load_proxies(input_file):
             return [line.strip() for line in file if line.strip()]
     except FileNotFoundError:
         print(f"Error: File '{input_file}' not found.")
+        return []
     except Exception as e:
         print(f"Error reading the file: {e}")
-    return []
+        return []
 
 def create_proxy_data(ip, port, username, password, index):
     """Create a dictionary representing the proxy configuration."""
@@ -18,7 +19,7 @@ def create_proxy_data(ip, port, username, password, index):
         "name": f"+m{index + 1}",
         "bypassList": [
             {"conditionType": "BypassCondition", "pattern": pattern}
-            for pattern in ["127.0.0.1", "[::1]", "localhost"]
+            for pattern in ["127.0.0.1", "::1", "localhost"]
         ],
         "color": "#ca0",
         "revision": "190a4bca575",
@@ -115,6 +116,8 @@ def convert_proxy_list(input_file, output_file):
     if proxies:
         output_data = generate_output_data(proxies)
         write_output_file(output_data, output_file)
+    else:
+        print("No proxies loaded. Exiting.")
 
 # Usage
 if __name__ == "__main__":
