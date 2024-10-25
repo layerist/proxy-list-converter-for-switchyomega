@@ -7,13 +7,12 @@ def load_proxies(input_file):
             return [line.strip() for line in file if line.strip()]
     except FileNotFoundError:
         print(f"Error: File '{input_file}' not found.")
-        return []
     except Exception as e:
-        print(f"Error reading the file: {e}")
-        return []
+        print(f"Error reading the file '{input_file}': {e}")
+    return []
 
 def create_proxy_data(ip, port, username, password, index):
-    """Create a dictionary representing the proxy configuration."""
+    """Create a dictionary for a proxy configuration."""
     return {
         "profileType": "FixedProfile",
         "name": f"+m{index + 1}",
@@ -37,7 +36,7 @@ def create_proxy_data(ip, port, username, password, index):
     }
 
 def generate_output_data(proxies):
-    """Generate the final output data structure."""
+    """Generate the output data structure for JSON export."""
     output_data = {
         "+auto switch": {
             "color": "#99dd99",
@@ -107,8 +106,8 @@ def write_output_file(output_data, output_file):
         with open(output_file, 'w') as file:
             json.dump(output_data, file, indent=4)
         print(f"Output successfully written to '{output_file}'")
-    except Exception as e:
-        print(f"Error writing to the file: {e}")
+    except IOError as e:
+        print(f"Error writing to the file '{output_file}': {e}")
 
 def convert_proxy_list(input_file, output_file):
     """Convert a list of proxies from a text file into a JSON configuration."""
@@ -117,7 +116,7 @@ def convert_proxy_list(input_file, output_file):
         output_data = generate_output_data(proxies)
         write_output_file(output_data, output_file)
     else:
-        print("No proxies loaded. Exiting.")
+        print("No valid proxies loaded. Exiting.")
 
 # Usage
 if __name__ == "__main__":
