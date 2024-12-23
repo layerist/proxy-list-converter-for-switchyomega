@@ -1,9 +1,16 @@
 import json
-from typing import List, Dict
+from typing import List, Dict, Any
+
+
+# Constants
+BYPASS_PATTERNS = ["127.0.0.1", "::1", "localhost"]
 
 
 def load_proxies(input_file: str) -> List[str]:
-    """Load proxies from a file and return a list of non-empty lines."""
+    """
+    Load proxies from a file and return a list of non-empty lines.
+    Each proxy line should follow the format: ip:port:username:password
+    """
     try:
         with open(input_file, 'r') as file:
             proxies = [line.strip() for line in file if line.strip()]
@@ -17,15 +24,14 @@ def load_proxies(input_file: str) -> List[str]:
     return []
 
 
-def create_proxy_data(ip: str, port: str, username: str, password: str, index: int) -> Dict:
-    """Create a dictionary for a proxy configuration."""
+def create_proxy_data(ip: str, port: str, username: str, password: str, index: int) -> Dict[str, Any]:
+    """
+    Create a dictionary for a proxy configuration.
+    """
     return {
         "profileType": "FixedProfile",
         "name": f"+m{index + 1}",
-        "bypassList": [
-            {"conditionType": "BypassCondition", "pattern": pattern}
-            for pattern in ["127.0.0.1", "::1", "localhost"]
-        ],
+        "bypassList": [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS],
         "color": "#ca0",
         "revision": "190a4bca575",
         "fallbackProxy": {"scheme": "http", "host": ip, "port": int(port)},
@@ -33,8 +39,10 @@ def create_proxy_data(ip: str, port: str, username: str, password: str, index: i
     }
 
 
-def generate_output_data(proxies: List[str]) -> Dict:
-    """Generate the output JSON structure from the proxy list."""
+def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
+    """
+    Generate the output JSON structure from the proxy list.
+    """
     output_data = {
         "+auto switch": {
             "color": "#99dd99",
@@ -43,27 +51,18 @@ def generate_output_data(proxies: List[str]) -> Dict:
             "profileType": "SwitchProfile",
             "rules": [
                 {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "internal.example.com",
-                    },
+                    "condition": {"conditionType": "HostWildcardCondition", "pattern": "internal.example.com"},
                     "profileName": "direct",
                 },
                 {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "*.example.com",
-                    },
+                    "condition": {"conditionType": "HostWildcardCondition", "pattern": "*.example.com"},
                     "profileName": "proxy",
                 },
             ],
         },
         "+proxy": {
             "auth": {},
-            "bypassList": [
-                {"conditionType": "BypassCondition", "pattern": pattern}
-                for pattern in ["127.0.0.1", "::1", "localhost"]
-            ],
+            "bypassList": [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS],
             "color": "#99ccee",
             "fallbackProxy": {"host": "127.0.0.1", "port": 80, "scheme": "http"},
             "name": "proxy",
@@ -94,18 +93,22 @@ def generate_output_data(proxies: List[str]) -> Dict:
     return output_data
 
 
-def write_output_file(output_data: Dict, output_file: str) -> None:
-    """Write the output data structure to a JSON file."""
+def write_output_file(output_data: Dict[str, Any], output_file: str) -> None:
+    """
+    Write the output data structure to a JSON file.
+    """
     try:
-        with open(output_file, 'w') as file:
-            json.dump(output_data, file, indent=4)
+        with open(output_file, 'w', encoding='utf-8') as file:
+            json.dump(output_data, file, indent=4, ensure_ascii=False)
         print(f"Output successfully written to '{output_file}'")
     except IOError as e:
         print(f"Error writing to the file '{output_file}': {e}")
 
 
 def convert_proxy_list(input_file: str, output_file: str) -> None:
-    """Convert a proxy list from a file to a JSON configuration."""
+    """
+    Convert a proxy list from a file to a JSON configuration.
+    """
     proxies = load_proxies(input_file)
     if proxies:
         output_data = generate_output_data(proxies)
