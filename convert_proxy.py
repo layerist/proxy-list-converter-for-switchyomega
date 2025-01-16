@@ -8,25 +8,42 @@ BYPASS_PATTERNS = ["127.0.0.1", "::1", "localhost"]
 
 def load_proxies(input_file: str) -> List[str]:
     """
-    Load proxies from a file and return a list of non-empty lines.
-    Each proxy line should follow the format: ip:port:username:password
+    Load proxies from a file and return a list of valid, non-empty lines.
+    Each proxy line should follow the format: ip:port:username:password.
+
+    Args:
+        input_file (str): Path to the input file containing proxies.
+
+    Returns:
+        List[str]: A list of proxy strings.
     """
     try:
-        with open(input_file, 'r') as file:
+        with open(input_file, 'r', encoding='utf-8') as file:
             proxies = [line.strip() for line in file if line.strip()]
         if not proxies:
             print("Warning: No proxies found in the file.")
         return proxies
     except FileNotFoundError:
         print(f"Error: File '{input_file}' not found.")
+        return []
     except Exception as e:
         print(f"Error reading the file '{input_file}': {e}")
-    return []
+        return []
 
 
 def create_proxy_data(ip: str, port: str, username: str, password: str, index: int) -> Dict[str, Any]:
     """
     Create a dictionary for a proxy configuration.
+
+    Args:
+        ip (str): Proxy IP address.
+        port (str): Proxy port.
+        username (str): Username for authentication.
+        password (str): Password for authentication.
+        index (int): Index of the proxy.
+
+    Returns:
+        Dict[str, Any]: Proxy configuration dictionary.
     """
     return {
         "profileType": "FixedProfile",
@@ -41,7 +58,13 @@ def create_proxy_data(ip: str, port: str, username: str, password: str, index: i
 
 def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
     """
-    Generate the output JSON structure from the proxy list.
+    Generate the output JSON structure from a list of proxies.
+
+    Args:
+        proxies (List[str]): List of proxy strings.
+
+    Returns:
+        Dict[str, Any]: JSON-compatible dictionary containing proxy configurations.
     """
     output_data = {
         "+auto switch": {
@@ -96,6 +119,10 @@ def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
 def write_output_file(output_data: Dict[str, Any], output_file: str) -> None:
     """
     Write the output data structure to a JSON file.
+
+    Args:
+        output_data (Dict[str, Any]): Data to write to the file.
+        output_file (str): Path to the output file.
     """
     try:
         with open(output_file, 'w', encoding='utf-8') as file:
@@ -107,7 +134,11 @@ def write_output_file(output_data: Dict[str, Any], output_file: str) -> None:
 
 def convert_proxy_list(input_file: str, output_file: str) -> None:
     """
-    Convert a proxy list from a file to a JSON configuration.
+    Convert a proxy list from a file to a structured JSON configuration.
+
+    Args:
+        input_file (str): Path to the input file.
+        output_file (str): Path to the output file.
     """
     proxies = load_proxies(input_file)
     if proxies:
