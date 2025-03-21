@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from typing import List, Dict, Any
 
 # Configure logging
@@ -10,34 +11,35 @@ BYPASS_PATTERNS = ["127.0.0.1", "::1", "localhost"]
 
 def load_proxies(input_file: str) -> List[str]:
     """Load proxies from a file, filtering out empty lines."""
-    try:
-        with open(input_file, 'r', encoding='utf-8') as file:
-            proxies = [line.strip() for line in file if line.strip()]
-        if not proxies:
-            logging.warning("No proxies found in the file.")
-        return proxies
-    except FileNotFoundError:
+    path = Path(input_file)
+    if not path.is_file():
         logging.error(f"File '{input_file}' not found.")
-    except Exception as e:
-        logging.error(f"Error reading the file '{input_file}': {e}")
-    return []
+        return []
+    
+    with path.open('r', encoding='utf-8') as file:
+        proxies = [line.strip() for line in file if line.strip()]
+    
+    if not proxies:
+        logging.warning("No proxies found in the file.")
+    return proxies
 
 def create_proxy_data(proxy: str, index: int) -> Dict[str, Any]:
     """Create a dictionary for a proxy configuration."""
-    try:
-        ip, port, username, password = proxy.split(':')
-        return {
-            "profileType": "FixedProfile",
-            "name": f"+m{index + 1}",
-            "bypassList": [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS],
-            "color": "#ca0",
-            "revision": "190a4bca575",
-            "fallbackProxy": {"scheme": "http", "host": ip, "port": int(port)},
-            "auth": {"fallbackProxy": {"username": username, "password": password}},
-        }
-    except ValueError:
+    parts = proxy.split(':')
+    if len(parts) != 4:
         logging.warning(f"Proxy '{proxy}' is incorrectly formatted. Skipping.")
         return {}
+    
+    ip, port, username, password = parts
+    return {
+        "profileType": "FixedProfile",
+        "name": f"+m{index + 1}",
+        "bypassList": [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS],
+        "color": "#ca0",
+        "revision": "190a4bca575",
+        "fallbackProxy": {"scheme": "http", "host": ip, "port": int(port)},
+        "auth": {"fallbackProxy": {"username": username, "password": password}},
+    }
 
 def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
     """Generate the output JSON structure from a list of proxies."""
@@ -53,7 +55,6 @@ def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
             ],
         },
         "+proxy": {
-            "auth": {},
             "bypassList": [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS],
             "color": "#99ccee",
             "fallbackProxy": {"host": "127.0.0.1", "port": 80, "scheme": "http"},
@@ -64,18 +65,15 @@ def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
         "schemaVersion": 2,
     }
     
-    for index, proxy in enumerate(proxies):
-        proxy_data = create_proxy_data(proxy, index)
-        if proxy_data:
-            output_data[f"+m{index + 1}"] = proxy_data
+    proxy_entries = {f"+m{index + 1}": data for index, proxy in enumerate(proxies) if (data := create_proxy_data(proxy, index))}
+    output_data.update(proxy_entries)
     
     return output_data
 
 def write_output_file(output_data: Dict[str, Any], output_file: str) -> None:
     """Write the output data structure to a JSON file."""
     try:
-        with open(output_file, 'w', encoding='utf-8') as file:
-            json.dump(output_data, file, indent=4, ensure_ascii=False)
+        Path(output_file).write_text(json.dumps(output_data, indent=4, ensure_ascii=False), encoding='utf-8')
         logging.info(f"Output successfully written to '{output_file}'")
     except IOError as e:
         logging.error(f"Error writing to the file '{output_file}': {e}")
@@ -83,14 +81,13 @@ def write_output_file(output_data: Dict[str, Any], output_file: str) -> None:
 def convert_proxy_list(input_file: str, output_file: str) -> None:
     """Convert a proxy list from a file to a structured JSON configuration."""
     proxies = load_proxies(input_file)
-    if proxies:
-        output_data = generate_output_data(proxies)
-        write_output_file(output_data, output_file)
-    else:
+    if not proxies:
         logging.error("No valid proxies loaded. Exiting.")
+        return
+    
+    output_data = generate_output_data(proxies)
+    write_output_file(output_data, output_file)
 
 # Entry point
 if __name__ == "__main__":
-    input_file = "proxy_list.txt"  # Replace with your input file name
-    output_file = "output.json"    # Replace with your desired output file name
-    convert_proxy_list(input_file, output_file)
+    convert_proxy_list("proxy_list.txt", "output.json")
