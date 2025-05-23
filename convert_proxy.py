@@ -4,48 +4,53 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 # Configure logging
-logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # Constants
-BYPASS_PATTERNS = ["127.0.0.1", "::1", "localhost"]
-SCHEMA_VERSION = 2
-REVISION_ID = "190a4bca575"
-DEFAULT_PROXY_COLOR = "#ca0"
-AUTO_SWITCH_NAME = "+auto switch"
-PROXY_GROUP_NAME = "+proxy"
-DEFAULT_REVISION_ID = "1908e30c31b"
+BYPASS_PATTERNS: List[str] = ["127.0.0.1", "::1", "localhost"]
+SCHEMA_VERSION: int = 2
+REVISION_ID: str = "190a4bca575"
+DEFAULT_REVISION_ID: str = "1908e30c31b"
+DEFAULT_PROXY_COLOR: str = "#ca0"
+AUTO_SWITCH_NAME: str = "+auto switch"
+PROXY_GROUP_NAME: str = "+proxy"
 
 def load_proxies(file_path: str) -> List[str]:
-    """Load non-empty lines from the proxy list file."""
+    """Load proxy strings from file, skipping empty lines."""
     path = Path(file_path)
     if not path.is_file():
         logger.error(f"Proxy list file not found: '{file_path}'")
         return []
 
-    with path.open(encoding="utf-8") as file:
-        proxies = [line.strip() for line in file if line.strip()]
-
+    proxies = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not proxies:
         logger.warning("The proxy list is empty.")
     return proxies
 
 def make_bypass_list() -> List[Dict[str, str]]:
-    """Generate a list of bypass condition dictionaries."""
+    """Create a list of proxy bypass patterns."""
     return [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS]
 
 def parse_proxy(proxy: str) -> Optional[Dict[str, str]]:
-    """Split proxy string into components."""
+    """
+    Parse a proxy string in the format IP:PORT:USERNAME:PASSWORD.
+    Returns a dict or None if the format is invalid.
+    """
     parts = proxy.split(":")
     if len(parts) != 4:
         logger.warning(f"Invalid proxy format skipped: '{proxy}'")
         return None
 
     ip, port, username, password = parts
+    if not (ip and port.isdigit() and username and password):
+        logger.warning(f"Malformed proxy entry skipped: '{proxy}'")
+        return None
+
     return {"ip": ip, "port": port, "username": username, "password": password}
 
 def create_proxy_profile(proxy_info: Dict[str, str], index: int) -> Dict[str, Any]:
-    """Create a single proxy profile entry."""
+    """Generate a proxy profile configuration dictionary."""
     return {
         "profileType": "FixedProfile",
         "name": f"+m{index + 1}",
@@ -65,9 +70,9 @@ def create_proxy_profile(proxy_info: Dict[str, str], index: int) -> Dict[str, An
         },
     }
 
-def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
-    """Build the full proxy configuration structure."""
-    output = {
+def build_base_profiles() -> Dict[str, Any]:
+    """Construct static parts of the configuration (switch and proxy group)."""
+    return {
         AUTO_SWITCH_NAME: {
             "profileType": "SwitchProfile",
             "name": "auto switch",
@@ -105,32 +110,33 @@ def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
         "schemaVersion": SCHEMA_VERSION,
     }
 
-    for index, proxy in enumerate(proxies):
-        proxy_info = parse_proxy(proxy)
+def generate_output_data(proxies: List[str]) -> Dict[str, Any]:
+    """Generate the full proxy configuration from a list of proxies."""
+    output = build_base_profiles()
+    for index, proxy_str in enumerate(proxies):
+        proxy_info = parse_proxy(proxy_str)
         if proxy_info:
             profile = create_proxy_profile(proxy_info, index)
             output[profile["name"]] = profile
-
     return output
 
 def write_output_file(data: Dict[str, Any], file_path: str) -> None:
-    """Save configuration data to a JSON file."""
+    """Write JSON configuration data to a file."""
     try:
-        json_output = json.dumps(data, indent=4, ensure_ascii=False)
-        Path(file_path).write_text(json_output, encoding="utf-8")
+        Path(file_path).write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
         logger.info(f"Successfully wrote configuration to '{file_path}'")
     except Exception:
-        logger.exception(f"Error writing to output file '{file_path}'")
+        logger.exception(f"Failed to write configuration to '{file_path}'")
 
 def convert_proxy_list(input_path: str, output_path: str) -> None:
-    """Main function to process proxy list and save the structured JSON."""
+    """Read proxies from input, generate configuration, and write to output."""
     proxies = load_proxies(input_path)
     if not proxies:
-        logger.error("No valid proxies to process. Aborting.")
+        logger.error("No valid proxies found. Aborting.")
         return
 
-    output_data = generate_output_data(proxies)
-    write_output_file(output_data, output_path)
+    config = generate_output_data(proxies)
+    write_output_file(config, output_path)
 
 if __name__ == "__main__":
     convert_proxy_list("proxy_list.txt", "output.json")
