@@ -1,5 +1,6 @@
 import json
 import logging
+import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -37,23 +38,18 @@ def load_proxy_list(file_path: str) -> List[str]:
     return lines
 
 def make_bypass_list() -> List[Dict[str, str]]:
-    """
-    Create a list of bypass conditions based on known patterns.
-
-    Returns:
-        A list of bypass condition dictionaries.
-    """
+    """Create a list of bypass conditions."""
     return [{"conditionType": "BypassCondition", "pattern": pattern} for pattern in BYPASS_PATTERNS]
 
 def parse_proxy_entry(entry: str) -> Optional[Dict[str, str]]:
     """
-    Parse a proxy string in the format IP:PORT:USERNAME:PASSWORD.
+    Parse a proxy string in the format: IP:PORT:USERNAME:PASSWORD
 
     Args:
         entry: The raw proxy string.
 
     Returns:
-        A dictionary with keys (ip, port, username, password), or None if invalid.
+        A dictionary with proxy details or None if invalid.
     """
     parts = entry.split(":")
     if len(parts) != 4:
@@ -68,16 +64,7 @@ def parse_proxy_entry(entry: str) -> Optional[Dict[str, str]]:
     return {"ip": ip, "port": port, "username": username, "password": password}
 
 def create_proxy_profile(proxy: Dict[str, str], index: int) -> Dict[str, Any]:
-    """
-    Generate a proxy profile configuration.
-
-    Args:
-        proxy: Parsed proxy dictionary.
-        index: Proxy profile index.
-
-    Returns:
-        A dictionary representing the proxy profile.
-    """
+    """Generate a proxy profile configuration."""
     return {
         "profileType": "FixedProfile",
         "name": f"+m{index + 1}",
@@ -98,12 +85,7 @@ def create_proxy_profile(proxy: Dict[str, str], index: int) -> Dict[str, Any]:
     }
 
 def build_static_profiles() -> Dict[str, Any]:
-    """
-    Create the static base profiles including the switch and proxy group.
-
-    Returns:
-        A dictionary of base profiles.
-    """
+    """Create static base profiles including the switch and proxy group."""
     return {
         AUTO_SWITCH_NAME: {
             "profileType": "SwitchProfile",
@@ -112,17 +94,11 @@ def build_static_profiles() -> Dict[str, Any]:
             "defaultProfileName": "direct",
             "rules": [
                 {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "internal.example.com",
-                    },
+                    "condition": {"conditionType": "HostWildcardCondition", "pattern": "internal.example.com"},
                     "profileName": "direct",
                 },
                 {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "*.example.com",
-                    },
+                    "condition": {"conditionType": "HostWildcardCondition", "pattern": "*.example.com"},
                     "profileName": "proxy",
                 },
             ],
@@ -143,15 +119,7 @@ def build_static_profiles() -> Dict[str, Any]:
     }
 
 def generate_config(proxies: List[str]) -> Dict[str, Any]:
-    """
-    Generate the full configuration dictionary.
-
-    Args:
-        proxies: A list of raw proxy strings.
-
-    Returns:
-        The complete configuration dictionary.
-    """
+    """Generate the full configuration dictionary."""
     config = build_static_profiles()
     for index, proxy_entry in enumerate(proxies):
         parsed = parse_proxy_entry(proxy_entry)
@@ -161,13 +129,7 @@ def generate_config(proxies: List[str]) -> Dict[str, Any]:
     return config
 
 def write_json_file(data: Dict[str, Any], output_path: str) -> None:
-    """
-    Write the configuration to a JSON file.
-
-    Args:
-        data: The configuration dictionary.
-        output_path: File path to write the JSON to.
-    """
+    """Write configuration to JSON file."""
     try:
         Path(output_path).write_text(
             json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8"
@@ -177,13 +139,7 @@ def write_json_file(data: Dict[str, Any], output_path: str) -> None:
         logger.exception(f"Failed to write configuration to '{output_path}': {e}")
 
 def convert_proxy_file(input_path: str, output_path: str) -> None:
-    """
-    Convert a raw proxy list file to a structured JSON configuration.
-
-    Args:
-        input_path: Path to the text file with proxies.
-        output_path: Path where the JSON configuration will be saved.
-    """
+    """Convert a raw proxy list file to a structured JSON configuration."""
     proxies = load_proxy_list(input_path)
     if not proxies:
         logger.error("No proxies found. Aborting.")
@@ -192,5 +148,13 @@ def convert_proxy_file(input_path: str, output_path: str) -> None:
     config = generate_config(proxies)
     write_json_file(config, output_path)
 
+def main():
+    parser = argparse.ArgumentParser(description="Convert proxy list to JSON configuration.")
+    parser.add_argument("input", help="Path to the input proxy list file")
+    parser.add_argument("output", help="Path to the output JSON configuration file")
+    args = parser.parse_args()
+
+    convert_proxy_file(args.input, args.output)
+
 if __name__ == "__main__":
-    convert_proxy_file("proxy_list.txt", "output.json")
+    main()
