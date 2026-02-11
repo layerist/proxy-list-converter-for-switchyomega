@@ -31,9 +31,9 @@ from typing import Any, Dict, List, Optional, TypedDict, Union
 # =============================================================================
 
 ENCODING = "utf-8"
+EXIT_FAILURE = 1
 
 SCHEMA_VERSION = 2
-
 REVISION_ID = "190a4bca575"
 DEFAULT_REVISION_ID = "1908e30c31b"
 
@@ -48,8 +48,6 @@ BYPASS_PATTERNS: List[str] = [
     "::1",
     "localhost",
 ]
-
-EXIT_FAILURE = 1
 
 # =============================================================================
 # Typed Structures
@@ -66,17 +64,15 @@ class ProxyEntry(TypedDict):
 # =============================================================================
 
 def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
-    """Configure and return a module-local logger."""
+    """Configure and return an isolated logger instance."""
     logger = logging.getLogger("proxy_converter")
-    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
 
-    level = logging.DEBUG if verbose else logging.INFO
-    logger.setLevel(level)
+    if logger.handlers:
+        return logger
 
     handler = logging.StreamHandler(sys.stdout)
-
-    formatter: logging.Formatter
 
     if colored:
         try:
@@ -95,10 +91,9 @@ def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
 
                 def format(self, record: logging.LogRecord) -> str:
                     color = self.COLORS.get(record.levelno, "")
-                    message = super().format(record)
-                    return f"{color}{message}{Style.RESET_ALL}"
+                    return f"{color}{super().format(record)}{Style.RESET_ALL}"
 
-            formatter = ColorFormatter("%(levelname)s: %(message)s")
+            formatter: logging.Formatter = ColorFormatter("%(levelname)s: %(message)s")
 
         except ImportError:
             formatter = logging.Formatter("%(levelname)s: %(message)s")
@@ -107,7 +102,6 @@ def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
     return logger
 
 # =============================================================================
@@ -115,26 +109,26 @@ def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
 # =============================================================================
 
 def load_proxy_list(path: Union[str, Path], logger: logging.Logger) -> List[str]:
-    """Load and sanitize proxy entries from a file."""
+    """Load, sanitize, and return proxy entries from a file."""
     file_path = Path(path)
 
     if not file_path.is_file():
-        logger.error("Proxy list not found: %s", file_path)
+        logger.error("Proxy list file not found: %s", file_path)
         return []
 
     try:
-        lines = file_path.read_text(encoding=ENCODING).splitlines()
-    except OSError:
-        logger.exception("Failed to read proxy list: %s", file_path)
+        raw_lines = file_path.read_text(encoding=ENCODING).splitlines()
+    except OSError as exc:
+        logger.exception("Failed to read proxy list: %s", exc)
         return []
 
     entries = [
         line.strip()
-        for line in lines
+        for line in raw_lines
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
-    logger.info("Loaded %d candidate entries", len(entries))
+    logger.info("Loaded %d candidate proxy entries", len(entries))
     return entries
 
 # =============================================================================
@@ -142,11 +136,11 @@ def load_proxy_list(path: Union[str, Path], logger: logging.Logger) -> List[str]
 # =============================================================================
 
 def parse_proxy(line: str, logger: logging.Logger) -> Optional[ProxyEntry]:
-    """Parse and validate a single proxy entry."""
-    parts = [part.strip() for part in line.split(":")]
+    """Parse and validate a single proxy line."""
+    parts = [p.strip() for p in line.split(":")]
 
     if len(parts) != 4:
-        logger.warning("Invalid format (expected 4 fields): %s", line)
+        logger.warning("Invalid format (expected IP:PORT:USER:PASS): %s", line)
         return None
 
     ip_raw, port_raw, username, password = parts
@@ -162,11 +156,11 @@ def parse_proxy(line: str, logger: logging.Logger) -> Optional[ProxyEntry]:
         if not 1 <= port <= 65535:
             raise ValueError
     except ValueError:
-        logger.warning("Invalid port: %s", port_raw)
+        logger.warning("Invalid port number: %s", port_raw)
         return None
 
     if not username or not password:
-        logger.warning("Missing credentials: %s", line)
+        logger.warning("Empty username or password: %s", line)
         return None
 
     return ProxyEntry(
@@ -177,7 +171,7 @@ def parse_proxy(line: str, logger: logging.Logger) -> Optional[ProxyEntry]:
     )
 
 def build_bypass_list() -> List[Dict[str, str]]:
-    """Build a standard bypass list configuration."""
+    """Return a standard bypass list configuration."""
     return [
         {"conditionType": "BypassCondition", "pattern": pattern}
         for pattern in BYPASS_PATTERNS
@@ -188,7 +182,7 @@ def build_bypass_list() -> List[Dict[str, str]]:
 # =============================================================================
 
 def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict[str, Any]:
-    """Build a single fixed proxy profile."""
+    """Build a fixed proxy profile definition."""
     return {
         "profileType": "FixedProfile",
         "name": f"{PROXY_PREFIX}{index}",
@@ -209,7 +203,7 @@ def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict[str, Any]:
     }
 
 def build_static_profiles() -> Dict[str, Any]:
-    """Build static, non-dynamic profiles."""
+    """Build static (non-generated) profiles and schema metadata."""
     return {
         AUTO_SWITCH_NAME: {
             "profileType": "SwitchProfile",
@@ -253,13 +247,13 @@ def build_static_profiles() -> Dict[str, Any]:
 # =============================================================================
 
 def generate_config(lines: List[str], logger: logging.Logger) -> Dict[str, Any]:
-    """Generate the final configuration structure."""
+    """Generate the full JSON configuration."""
     config = build_static_profiles()
     index = 1
 
     for line in lines:
         proxy = parse_proxy(line, logger)
-        if not proxy:
+        if proxy is None:
             continue
 
         config[f"{PROXY_PREFIX}{index}"] = build_proxy_profile(proxy, index)
@@ -273,7 +267,7 @@ def write_json_atomic(
     destination: Union[str, Path],
     logger: logging.Logger,
 ) -> None:
-    """Write JSON output atomically to disk."""
+    """Write JSON output atomically."""
     path = Path(destination)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
 
@@ -283,9 +277,9 @@ def write_json_atomic(
             encoding=ENCODING,
         )
         tmp_path.replace(path)
-        logger.info("Configuration saved: %s", path)
-    except OSError:
-        logger.exception("Failed to write output file: %s", path)
+        logger.info("Configuration written to %s", path)
+    except OSError as exc:
+        logger.exception("Failed to write output file: %s", exc)
 
 # =============================================================================
 # Main
@@ -298,7 +292,7 @@ def main() -> None:
     parser.add_argument("input", help="Input proxy list file")
     parser.add_argument("output", help="Output JSON file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--color", action="store_true", help="Enable colored log output")
+    parser.add_argument("--color", action="store_true", help="Enable colored logging")
 
     args = parser.parse_args()
     logger = setup_logging(verbose=args.verbose, colored=args.color)
