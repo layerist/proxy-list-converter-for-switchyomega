@@ -3,17 +3,20 @@
 Proxy List Converter
 ====================
 
-Converts plaintext proxy lists in the format:
+Convert plaintext proxy lists:
 
     IP:PORT:USERNAME:PASSWORD
 
-into a structured JSON configuration compatible with custom proxy tools.
+into structured JSON configuration.
 
-Features:
-  • Strict proxy validation (IP, port, credentials)
-  • Comment and whitespace filtering
-  • Atomic JSON output writing
-  • Optional colored and verbose logging
+Features
+--------
+• Strict proxy validation
+• Duplicate proxy detection
+• Comment and whitespace filtering
+• Atomic JSON writing
+• Deterministic output ordering
+• Optional colored and verbose logging
 """
 
 from __future__ import annotations
@@ -24,11 +27,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict, Union
-
-# =============================================================================
-# Constants
-# =============================================================================
+from typing import Dict, Iterable, Iterator, List, Optional, TypedDict
 
 ENCODING = "utf-8"
 EXIT_FAILURE = 1
@@ -43,15 +42,12 @@ AUTO_SWITCH_NAME = "+auto switch"
 PROXY_GROUP_NAME = "+proxy"
 PROXY_PREFIX = "+m"
 
-BYPASS_PATTERNS: List[str] = [
+BYPASS_PATTERNS = (
     "127.0.0.1",
     "::1",
     "localhost",
-]
+)
 
-# =============================================================================
-# Typed Structures
-# =============================================================================
 
 class ProxyEntry(TypedDict):
     ip: str
@@ -59,26 +55,27 @@ class ProxyEntry(TypedDict):
     username: str
     password: str
 
-# =============================================================================
-# Logging
-# =============================================================================
 
-def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
-    """Configure and return an isolated logger instance."""
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
     logger = logging.getLogger("proxy_converter")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.propagate = False
 
     if logger.handlers:
         return logger
 
-    handler = logging.StreamHandler(sys.stdout)
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    handler = logging.StreamHandler()
+
+    formatter: logging.Formatter
 
     if colored:
         try:
             from colorama import Fore, Style, init
-
-            init(autoreset=True)
+            init()
 
             class ColorFormatter(logging.Formatter):
                 COLORS = {
@@ -91,56 +88,50 @@ def setup_logging(*, verbose: bool, colored: bool) -> logging.Logger:
 
                 def format(self, record: logging.LogRecord) -> str:
                     color = self.COLORS.get(record.levelno, "")
-                    return f"{color}{super().format(record)}{Style.RESET_ALL}"
+                    message = super().format(record)
+                    return f"{color}{message}{Style.RESET_ALL}"
 
-            formatter: logging.Formatter = ColorFormatter("%(levelname)s: %(message)s")
+            formatter = ColorFormatter("%(levelname)s: %(message)s")
 
         except ImportError:
             formatter = logging.Formatter("%(levelname)s: %(message)s")
+
     else:
         formatter = logging.Formatter("%(levelname)s: %(message)s")
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
     return logger
 
-# =============================================================================
-# File Handling
-# =============================================================================
 
-def load_proxy_list(path: Union[str, Path], logger: logging.Logger) -> List[str]:
-    """Load, sanitize, and return proxy entries from a file."""
-    file_path = Path(path)
+# -----------------------------------------------------------------------------
+# File Reader
+# -----------------------------------------------------------------------------
 
-    if not file_path.is_file():
-        logger.error("Proxy list file not found: %s", file_path)
-        return []
+def iter_proxy_lines(path: Path) -> Iterator[str]:
+    """Yield sanitized proxy lines."""
+    with path.open("r", encoding=ENCODING) as f:
+        for line in f:
+            line = line.strip()
 
-    try:
-        raw_lines = file_path.read_text(encoding=ENCODING).splitlines()
-    except OSError as exc:
-        logger.exception("Failed to read proxy list: %s", exc)
-        return []
+            if not line:
+                continue
 
-    entries = [
-        line.strip()
-        for line in raw_lines
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+            if line.startswith("#"):
+                continue
 
-    logger.info("Loaded %d candidate proxy entries", len(entries))
-    return entries
+            yield line
 
-# =============================================================================
-# Parsing & Validation
-# =============================================================================
 
-def parse_proxy(line: str, logger: logging.Logger) -> Optional[ProxyEntry]:
-    """Parse and validate a single proxy line."""
-    parts = [p.strip() for p in line.split(":")]
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+def parse_proxy(line: str) -> Optional[ProxyEntry]:
+    parts = line.split(":")
 
     if len(parts) != 4:
-        logger.warning("Invalid format (expected IP:PORT:USER:PASS): %s", line)
         return None
 
     ip_raw, port_raw, username, password = parts
@@ -148,41 +139,38 @@ def parse_proxy(line: str, logger: logging.Logger) -> Optional[ProxyEntry]:
     try:
         ipaddress.ip_address(ip_raw)
     except ValueError:
-        logger.warning("Invalid IP address: %s", ip_raw)
         return None
 
     try:
         port = int(port_raw)
         if not 1 <= port <= 65535:
-            raise ValueError
+            return None
     except ValueError:
-        logger.warning("Invalid port number: %s", port_raw)
         return None
 
     if not username or not password:
-        logger.warning("Empty username or password: %s", line)
         return None
 
-    return ProxyEntry(
-        ip=ip_raw,
-        port=port,
-        username=username,
-        password=password,
-    )
+    return {
+        "ip": ip_raw,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Builders
+# -----------------------------------------------------------------------------
 
 def build_bypass_list() -> List[Dict[str, str]]:
-    """Return a standard bypass list configuration."""
     return [
-        {"conditionType": "BypassCondition", "pattern": pattern}
-        for pattern in BYPASS_PATTERNS
+        {"conditionType": "BypassCondition", "pattern": p}
+        for p in BYPASS_PATTERNS
     ]
 
-# =============================================================================
-# Profile Builders
-# =============================================================================
 
-def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict[str, Any]:
-    """Build a fixed proxy profile definition."""
+def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict:
     return {
         "profileType": "FixedProfile",
         "name": f"{PROXY_PREFIX}{index}",
@@ -202,8 +190,8 @@ def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict[str, Any]:
         },
     }
 
-def build_static_profiles() -> Dict[str, Any]:
-    """Build static (non-generated) profiles and schema metadata."""
+
+def build_static_profiles() -> Dict:
     return {
         AUTO_SWITCH_NAME: {
             "profileType": "SwitchProfile",
@@ -242,68 +230,84 @@ def build_static_profiles() -> Dict[str, Any]:
         "schemaVersion": SCHEMA_VERSION,
     }
 
-# =============================================================================
-# JSON Generation
-# =============================================================================
 
-def generate_config(lines: List[str], logger: logging.Logger) -> Dict[str, Any]:
-    """Generate the full JSON configuration."""
+# -----------------------------------------------------------------------------
+# Generator
+# -----------------------------------------------------------------------------
+
+def generate_config(lines: Iterable[str], logger: logging.Logger) -> Dict:
     config = build_static_profiles()
+
+    seen = set()
     index = 1
 
     for line in lines:
-        proxy = parse_proxy(line, logger)
+        proxy = parse_proxy(line)
+
         if proxy is None:
+            logger.warning("Invalid proxy: %s", line)
             continue
+
+        key = (proxy["ip"], proxy["port"], proxy["username"])
+
+        if key in seen:
+            logger.debug("Duplicate proxy skipped: %s", line)
+            continue
+
+        seen.add(key)
 
         config[f"{PROXY_PREFIX}{index}"] = build_proxy_profile(proxy, index)
         index += 1
 
-    logger.info("Generated %d valid proxy profiles", index - 1)
+    logger.info("Valid proxies: %d", index - 1)
+
     return config
 
-def write_json_atomic(
-    data: Dict[str, Any],
-    destination: Union[str, Path],
-    logger: logging.Logger,
-) -> None:
-    """Write JSON output atomically."""
-    path = Path(destination)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
 
-    try:
-        tmp_path.write_text(
-            json.dumps(data, indent=4, ensure_ascii=False),
-            encoding=ENCODING,
-        )
-        tmp_path.replace(path)
-        logger.info("Configuration written to %s", path)
-    except OSError as exc:
-        logger.exception("Failed to write output file: %s", exc)
+# -----------------------------------------------------------------------------
+# Writer
+# -----------------------------------------------------------------------------
 
-# =============================================================================
-# Main
-# =============================================================================
+def write_json_atomic(data: Dict, destination: Path) -> None:
+    tmp = destination.with_suffix(".tmp")
+
+    with tmp.open("w", encoding=ENCODING) as f:
+        json.dump(data, f, indent=4, ensure_ascii=False, sort_keys=True)
+
+    tmp.replace(destination)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert a proxy list into a structured JSON configuration."
+        description="Convert proxy list into JSON configuration."
     )
-    parser.add_argument("input", help="Input proxy list file")
-    parser.add_argument("output", help="Output JSON file")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--color", action="store_true", help="Enable colored logging")
+
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--color", action="store_true")
 
     args = parser.parse_args()
-    logger = setup_logging(verbose=args.verbose, colored=args.color)
 
-    lines = load_proxy_list(args.input, logger)
-    if not lines:
-        logger.error("No valid proxy entries found. Aborting.")
+    logger = setup_logging(args.verbose, args.color)
+
+    if not args.input.exists():
+        logger.error("Input file not found: %s", args.input)
         sys.exit(EXIT_FAILURE)
 
+    lines = iter_proxy_lines(args.input)
+
     config = generate_config(lines, logger)
-    write_json_atomic(config, args.output, logger)
+
+    write_json_atomic(config, args.output)
+
+    logger.info("Output written: %s", args.output)
+
 
 if __name__ == "__main__":
     main()
