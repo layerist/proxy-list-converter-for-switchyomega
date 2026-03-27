@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Proxy List Converter
-====================
+Advanced Proxy List Converter
+=============================
 
-Convert plaintext proxy lists:
+Converts plaintext proxy lists into structured JSON configuration.
 
+Supported input formats:
     IP:PORT:USERNAME:PASSWORD
+    HOST:PORT:USERNAME:PASSWORD
+    [scheme://]IP:PORT:USERNAME:PASSWORD
 
-into structured JSON configuration.
+Examples:
+    1.2.3.4:8080:user:pass
+    socks5://1.2.3.4:1080:user:pass
 
 Features
 --------
-• Strict proxy validation
-• Duplicate proxy detection
-• Comment and whitespace filtering
-• Atomic JSON writing
-• Deterministic output ordering
-• Optional colored and verbose logging
+• Strict validation (IP + hostname support)
+• Protocol detection (http/https/socks5)
+• Duplicate detection (strong key)
+• Stats reporting
+• Atomic JSON writing with fsync
+• Deterministic output
+• Optional colored logging
 """
 
 from __future__ import annotations
@@ -25,6 +31,9 @@ import argparse
 import ipaddress
 import json
 import logging
+import os
+import re
+import socket
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, TypedDict
@@ -48,9 +57,12 @@ BYPASS_PATTERNS = (
     "localhost",
 )
 
+SUPPORTED_SCHEMES = {"http", "https", "socks5"}
+
 
 class ProxyEntry(TypedDict):
-    ip: str
+    scheme: str
+    host: str
     port: int
     username: str
     password: str
@@ -67,10 +79,7 @@ def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
         return logger
 
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-
     handler = logging.StreamHandler()
-
-    formatter: logging.Formatter
 
     if colored:
         try:
@@ -86,16 +95,14 @@ def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
                     logging.CRITICAL: Fore.MAGENTA,
                 }
 
-                def format(self, record: logging.LogRecord) -> str:
+                def format(self, record):
                     color = self.COLORS.get(record.levelno, "")
-                    message = super().format(record)
-                    return f"{color}{message}{Style.RESET_ALL}"
+                    return f"{color}{super().format(record)}{Style.RESET_ALL}"
 
             formatter = ColorFormatter("%(levelname)s: %(message)s")
 
         except ImportError:
             formatter = logging.Formatter("%(levelname)s: %(message)s")
-
     else:
         formatter = logging.Formatter("%(levelname)s: %(message)s")
 
@@ -110,15 +117,11 @@ def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
 # -----------------------------------------------------------------------------
 
 def iter_proxy_lines(path: Path) -> Iterator[str]:
-    """Yield sanitized proxy lines."""
     with path.open("r", encoding=ENCODING) as f:
         for line in f:
             line = line.strip()
 
-            if not line:
-                continue
-
-            if line.startswith("#"):
+            if not line or line.startswith("#"):
                 continue
 
             yield line
@@ -128,22 +131,50 @@ def iter_proxy_lines(path: Path) -> Iterator[str]:
 # Validation
 # -----------------------------------------------------------------------------
 
+HOST_REGEX = re.compile(r"^[a-zA-Z0-9.-]+$")
+
+
+def is_valid_host(host: str) -> bool:
+    # Try IP first
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+
+    # Validate hostname
+    if not HOST_REGEX.match(host):
+        return False
+
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror:
+        return False
+
+
 def parse_proxy(line: str) -> Optional[ProxyEntry]:
+    scheme = "http"
+
+    if "://" in line:
+        scheme_part, line = line.split("://", 1)
+        if scheme_part.lower() not in SUPPORTED_SCHEMES:
+            return None
+        scheme = scheme_part.lower()
+
     parts = line.split(":")
 
     if len(parts) != 4:
         return None
 
-    ip_raw, port_raw, username, password = parts
+    host, port_raw, username, password = parts
 
-    try:
-        ipaddress.ip_address(ip_raw)
-    except ValueError:
+    if not is_valid_host(host):
         return None
 
     try:
         port = int(port_raw)
-        if not 1 <= port <= 65535:
+        if not (1 <= port <= 65535):
             return None
     except ValueError:
         return None
@@ -152,7 +183,8 @@ def parse_proxy(line: str) -> Optional[ProxyEntry]:
         return None
 
     return {
-        "ip": ip_raw,
+        "scheme": scheme,
+        "host": host,
         "port": port,
         "username": username,
         "password": password,
@@ -178,8 +210,8 @@ def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict:
         "revision": REVISION_ID,
         "bypassList": build_bypass_list(),
         "fallbackProxy": {
-            "scheme": "http",
-            "host": entry["ip"],
+            "scheme": entry["scheme"],
+            "host": entry["host"],
             "port": entry["port"],
         },
         "auth": {
@@ -198,22 +230,7 @@ def build_static_profiles() -> Dict:
             "name": "auto switch",
             "color": "#99dd99",
             "defaultProfileName": "direct",
-            "rules": [
-                {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "internal.example.com",
-                    },
-                    "profileName": "direct",
-                },
-                {
-                    "condition": {
-                        "conditionType": "HostWildcardCondition",
-                        "pattern": "*.example.com",
-                    },
-                    "profileName": "proxy",
-                },
-            ],
+            "rules": [],
         },
         PROXY_GROUP_NAME: {
             "profileType": "FixedProfile",
@@ -241,25 +258,44 @@ def generate_config(lines: Iterable[str], logger: logging.Logger) -> Dict:
     seen = set()
     index = 1
 
+    stats = {
+        "valid": 0,
+        "invalid": 0,
+        "duplicates": 0,
+    }
+
     for line in lines:
         proxy = parse_proxy(line)
 
         if proxy is None:
+            stats["invalid"] += 1
             logger.warning("Invalid proxy: %s", line)
             continue
 
-        key = (proxy["ip"], proxy["port"], proxy["username"])
+        key = (
+            proxy["scheme"],
+            proxy["host"],
+            proxy["port"],
+            proxy["username"],
+        )
 
         if key in seen:
-            logger.debug("Duplicate proxy skipped: %s", line)
+            stats["duplicates"] += 1
+            logger.debug("Duplicate skipped: %s", line)
             continue
 
         seen.add(key)
 
         config[f"{PROXY_PREFIX}{index}"] = build_proxy_profile(proxy, index)
         index += 1
+        stats["valid"] += 1
 
-    logger.info("Valid proxies: %d", index - 1)
+    logger.info(
+        "Stats → valid: %d | invalid: %d | duplicates: %d",
+        stats["valid"],
+        stats["invalid"],
+        stats["duplicates"],
+    )
 
     return config
 
@@ -273,6 +309,8 @@ def write_json_atomic(data: Dict, destination: Path) -> None:
 
     with tmp.open("w", encoding=ENCODING) as f:
         json.dump(data, f, indent=4, ensure_ascii=False, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
 
     tmp.replace(destination)
 
@@ -300,11 +338,14 @@ def main() -> None:
         logger.error("Input file not found: %s", args.input)
         sys.exit(EXIT_FAILURE)
 
-    lines = iter_proxy_lines(args.input)
+    try:
+        lines = iter_proxy_lines(args.input)
+        config = generate_config(lines, logger)
+        write_json_atomic(config, args.output)
 
-    config = generate_config(lines, logger)
-
-    write_json_atomic(config, args.output)
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        sys.exit(EXIT_FAILURE)
 
     logger.info("Output written: %s", args.output)
 
