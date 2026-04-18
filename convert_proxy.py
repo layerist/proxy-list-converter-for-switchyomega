@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """
-Advanced Proxy List Converter
-=============================
+Advanced Proxy List Converter (Improved)
+=======================================
 
-Converts plaintext proxy lists into structured JSON configuration.
+Major improvements:
+• IPv4 + IPv6 + hostname support
+• Passwords may contain ':' (fixed parsing)
+• Optional DNS resolution (--resolve)
+• Faster validation (no DNS by default)
+• Deterministic ordering
+• Better duplicate detection (configurable)
+• Threaded validation for large lists
+• Cleaner architecture
 
-Supported input formats:
-    IP:PORT:USERNAME:PASSWORD
-    HOST:PORT:USERNAME:PASSWORD
-    [scheme://]IP:PORT:USERNAME:PASSWORD
-
-Examples:
-    1.2.3.4:8080:user:pass
-    socks5://1.2.3.4:1080:user:pass
-
-Features
---------
-• Strict validation (IP + hostname support)
-• Protocol detection (http/https/socks5)
-• Duplicate detection (strong key)
-• Stats reporting
-• Atomic JSON writing with fsync
-• Deterministic output
-• Optional colored logging
+Author: improved version
 """
 
 from __future__ import annotations
@@ -35,8 +26,13 @@ import os
 import re
 import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, TypedDict
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple, TypedDict
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
 
 ENCODING = "utf-8"
 EXIT_FAILURE = 1
@@ -51,14 +47,15 @@ AUTO_SWITCH_NAME = "+auto switch"
 PROXY_GROUP_NAME = "+proxy"
 PROXY_PREFIX = "+m"
 
-BYPASS_PATTERNS = (
-    "127.0.0.1",
-    "::1",
-    "localhost",
-)
-
 SUPPORTED_SCHEMES = {"http", "https", "socks5"}
 
+BYPASS_PATTERNS = ("127.0.0.1", "::1", "localhost")
+
+HOST_REGEX = re.compile(r"^[a-zA-Z0-9.-]+$")
+
+# -----------------------------------------------------------------------------
+# Types
+# -----------------------------------------------------------------------------
 
 class ProxyEntry(TypedDict):
     scheme: str
@@ -72,7 +69,7 @@ class ProxyEntry(TypedDict):
 # Logging
 # -----------------------------------------------------------------------------
 
-def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
+def setup_logging(verbose: bool) -> logging.Logger:
     logger = logging.getLogger("proxy_converter")
 
     if logger.handlers:
@@ -80,31 +77,7 @@ def setup_logging(verbose: bool, colored: bool) -> logging.Logger:
 
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     handler = logging.StreamHandler()
-
-    if colored:
-        try:
-            from colorama import Fore, Style, init
-            init()
-
-            class ColorFormatter(logging.Formatter):
-                COLORS = {
-                    logging.DEBUG: Fore.CYAN,
-                    logging.INFO: Fore.GREEN,
-                    logging.WARNING: Fore.YELLOW,
-                    logging.ERROR: Fore.RED,
-                    logging.CRITICAL: Fore.MAGENTA,
-                }
-
-                def format(self, record):
-                    color = self.COLORS.get(record.levelno, "")
-                    return f"{color}{super().format(record)}{Style.RESET_ALL}"
-
-            formatter = ColorFormatter("%(levelname)s: %(message)s")
-
-        except ImportError:
-            formatter = logging.Formatter("%(levelname)s: %(message)s")
-    else:
-        formatter = logging.Formatter("%(levelname)s: %(message)s")
+    formatter = logging.Formatter("%(levelname)s: %(message)s")
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -120,31 +93,26 @@ def iter_proxy_lines(path: Path) -> Iterator[str]:
     with path.open("r", encoding=ENCODING) as f:
         for line in f:
             line = line.strip()
-
-            if not line or line.startswith("#"):
-                continue
-
-            yield line
+            if line and not line.startswith("#"):
+                yield line
 
 
 # -----------------------------------------------------------------------------
 # Validation
 # -----------------------------------------------------------------------------
 
-HOST_REGEX = re.compile(r"^[a-zA-Z0-9.-]+$")
-
-
-def is_valid_host(host: str) -> bool:
-    # Try IP first
+def is_valid_host(host: str, resolve: bool) -> bool:
     try:
         ipaddress.ip_address(host)
         return True
     except ValueError:
         pass
 
-    # Validate hostname
     if not HOST_REGEX.match(host):
         return False
+
+    if not resolve:
+        return True
 
     try:
         socket.getaddrinfo(host, None)
@@ -153,23 +121,45 @@ def is_valid_host(host: str) -> bool:
         return False
 
 
-def parse_proxy(line: str) -> Optional[ProxyEntry]:
+# -----------------------------------------------------------------------------
+# Parsing (FIXED for ':' in password + IPv6)
+# -----------------------------------------------------------------------------
+
+def parse_proxy(line: str, resolve: bool) -> Optional[ProxyEntry]:
     scheme = "http"
 
     if "://" in line:
         scheme_part, line = line.split("://", 1)
-        if scheme_part.lower() not in SUPPORTED_SCHEMES:
+        scheme_part = scheme_part.lower()
+
+        if scheme_part not in SUPPORTED_SCHEMES:
             return None
-        scheme = scheme_part.lower()
 
-    parts = line.split(":")
+        scheme = scheme_part
 
-    if len(parts) != 4:
-        return None
+    # IPv6 handling: [::1]:port:user:pass
+    if line.startswith("["):
+        try:
+            host_end = line.index("]")
+            host = line[1:host_end]
+            rest = line[host_end + 2 :]  # skip ]:
+        except ValueError:
+            return None
 
-    host, port_raw, username, password = parts
+        parts = rest.split(":", 2)
+        if len(parts) != 3:
+            return None
 
-    if not is_valid_host(host):
+        port_raw, username, password = parts
+
+    else:
+        parts = line.split(":", 3)
+        if len(parts) != 4:
+            return None
+
+        host, port_raw, username, password = parts
+
+    if not is_valid_host(host, resolve):
         return None
 
     try:
@@ -196,10 +186,7 @@ def parse_proxy(line: str) -> Optional[ProxyEntry]:
 # -----------------------------------------------------------------------------
 
 def build_bypass_list() -> List[Dict[str, str]]:
-    return [
-        {"conditionType": "BypassCondition", "pattern": p}
-        for p in BYPASS_PATTERNS
-    ]
+    return [{"conditionType": "BypassCondition", "pattern": p} for p in BYPASS_PATTERNS]
 
 
 def build_proxy_profile(entry: ProxyEntry, index: int) -> Dict:
@@ -249,46 +236,57 @@ def build_static_profiles() -> Dict:
 
 
 # -----------------------------------------------------------------------------
-# Generator
+# Generator (threaded)
 # -----------------------------------------------------------------------------
 
-def generate_config(lines: Iterable[str], logger: logging.Logger) -> Dict:
+def generate_config(
+    lines: Iterable[str],
+    logger: logging.Logger,
+    resolve: bool,
+    threads: int,
+) -> Dict:
+
     config = build_static_profiles()
 
-    seen = set()
-    index = 1
+    seen: Set[Tuple] = set()
+    proxies: List[ProxyEntry] = []
 
-    stats = {
-        "valid": 0,
-        "invalid": 0,
-        "duplicates": 0,
-    }
+    stats = {"valid": 0, "invalid": 0, "duplicates": 0}
 
-    for line in lines:
-        proxy = parse_proxy(line)
+    def process(line: str):
+        return line, parse_proxy(line, resolve)
 
-        if proxy is None:
-            stats["invalid"] += 1
-            logger.warning("Invalid proxy: %s", line)
-            continue
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(process, line) for line in lines]
 
-        key = (
-            proxy["scheme"],
-            proxy["host"],
-            proxy["port"],
-            proxy["username"],
-        )
+        for future in as_completed(futures):
+            line, proxy = future.result()
 
-        if key in seen:
-            stats["duplicates"] += 1
-            logger.debug("Duplicate skipped: %s", line)
-            continue
+            if proxy is None:
+                stats["invalid"] += 1
+                continue
 
-        seen.add(key)
+            key = (
+                proxy["scheme"],
+                proxy["host"],
+                proxy["port"],
+                proxy["username"],
+                proxy["password"],
+            )
 
-        config[f"{PROXY_PREFIX}{index}"] = build_proxy_profile(proxy, index)
-        index += 1
-        stats["valid"] += 1
+            if key in seen:
+                stats["duplicates"] += 1
+                continue
+
+            seen.add(key)
+            proxies.append(proxy)
+            stats["valid"] += 1
+
+    # Deterministic ordering
+    proxies.sort(key=lambda x: (x["host"], x["port"], x["username"]))
+
+    for i, proxy in enumerate(proxies, 1):
+        config[f"{PROXY_PREFIX}{i}"] = build_proxy_profile(proxy, i)
 
     logger.info(
         "Stats → valid: %d | invalid: %d | duplicates: %d",
@@ -320,27 +318,33 @@ def write_json_atomic(data: Dict, destination: Path) -> None:
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Convert proxy list into JSON configuration."
-    )
+    parser = argparse.ArgumentParser(description="Convert proxy list into JSON config")
 
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
 
+    parser.add_argument("--resolve", action="store_true", help="Enable DNS resolution")
+    parser.add_argument("--threads", type=int, default=10)
     parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("--color", action="store_true")
 
     args = parser.parse_args()
 
-    logger = setup_logging(args.verbose, args.color)
+    logger = setup_logging(args.verbose)
 
     if not args.input.exists():
         logger.error("Input file not found: %s", args.input)
         sys.exit(EXIT_FAILURE)
 
     try:
-        lines = iter_proxy_lines(args.input)
-        config = generate_config(lines, logger)
+        lines = list(iter_proxy_lines(args.input))
+
+        config = generate_config(
+            lines=lines,
+            logger=logger,
+            resolve=args.resolve,
+            threads=args.threads,
+        )
+
         write_json_atomic(config, args.output)
 
     except Exception as e:
