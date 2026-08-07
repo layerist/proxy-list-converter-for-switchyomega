@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Proxy List Converter v2
+Reliable Proxy List Converter v3
 ================================
 
 Converts proxy lists to a SwitchyOmega-compatible JSON configuration.
@@ -16,11 +16,12 @@ Important features:
 - IPv4, IPv6 and IDN host support.
 - Passwords containing ':' are supported.
 - URL-encoded credentials are decoded.
-- Streaming producer/worker pipeline with bounded memory usage.
+- Bounded producer/worker queues with deterministic worker shutdown.
 - Coalescing DNS cache: repeated hosts are resolved only once.
 - Optional real proxy handshake check, including authentication.
 - Atomic output writes.
-- Optional rejected-line report.
+- Optional rejected-line report with precise failure reasons.
+- Accurate parse/network statistics and safer HTTP header limits.
 """
 
 from __future__ import annotations
@@ -64,6 +65,8 @@ DEFAULT_QUEUE_MULTIPLIER = 4
 DEFAULT_PROGRESS_EVERY = 1000
 DEFAULT_CHECK_TARGET = "example.com:443"
 MAX_HTTP_RESPONSE = 16 * 1024
+HTTP_READ_CHUNK = 2048
+MAX_INPUT_LINE = 64 * 1024
 
 DedupeMode = Literal["full", "endpoint"]
 CheckMode = Literal["none", "tcp", "proxy"]
@@ -115,7 +118,17 @@ class Settings:
 
 
 WorkItem = tuple[int, str] | None
-ResultItem = tuple[int, str, Optional[ProxyEntry], Optional[str]]
+@dataclass(frozen=True, slots=True)
+class ResultItem:
+    line_no: int
+    line: str
+    parsed: bool
+    proxy: Optional[ProxyEntry]
+    reason: Optional[str]
+
+
+RESULT_WORKER_DONE = object()
+ResultQueueItem = ResultItem | object
 
 
 def setup_logging(verbose: bool) -> logging.Logger:
@@ -137,7 +150,11 @@ def iter_proxy_lines(path: Path) -> Iterator[tuple[int, str]]:
         for line_no, raw_line in enumerate(file, 1):
             line = raw_line.strip().lstrip("\ufeff")
             if line and not line.startswith("#"):
-                yield line_no, line
+                if len(line) > MAX_INPUT_LINE:
+                    # Keep processing deterministic and avoid pathological input records.
+                    yield line_no, line[:MAX_INPUT_LINE + 1]
+                else:
+                    yield line_no, line
 
 
 def _atomic_text_writer(destination: Path):
@@ -293,6 +310,8 @@ def parse_standard_url(line: str) -> Optional[ProxyEntry]:
 
     if scheme not in SUPPORTED_SCHEMES or not host or port is None:
         return None
+    if parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        return None
     return make_proxy(scheme, host, port, parsed.username or "", parsed.password or "")
 
 
@@ -357,10 +376,28 @@ async def check_tcp(proxy: ProxyEntry, timeout: float) -> bool:
 
 
 async def read_http_headers(reader: asyncio.StreamReader, timeout: float) -> bytes:
-    data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
-    if len(data) > MAX_HTTP_RESPONSE:
-        raise ValueError("oversized HTTP response")
-    return data
+    """Read only the HTTP header block, enforcing a hard byte limit while reading."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    data = bytearray()
+
+    while b"\r\n\r\n" not in data:
+        if len(data) >= MAX_HTTP_RESPONSE:
+            raise ValueError("oversized HTTP response")
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+
+        chunk = await asyncio.wait_for(
+            reader.read(min(HTTP_READ_CHUNK, MAX_HTTP_RESPONSE - len(data))),
+            remaining,
+        )
+        if not chunk:
+            raise asyncio.IncompleteReadError(bytes(data), None)
+        data.extend(chunk)
+
+    header_end = data.find(b"\r\n\r\n") + 4
+    return bytes(data[:header_end])
 
 
 async def check_http_proxy(proxy: ProxyEntry, target_host: str,
@@ -377,7 +414,7 @@ async def check_http_proxy(proxy: ProxyEntry, target_host: str,
             f"Host: {authority}\r\n"
             f"Proxy-Authorization: Basic {credentials}\r\n"
             "Proxy-Connection: close\r\n"
-            "User-Agent: proxy-list-converter/2\r\n\r\n"
+            "User-Agent: proxy-list-converter/3\r\n\r\n"
         ).encode("ascii")
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout)
@@ -524,39 +561,50 @@ def build_config(proxies: Sequence[ProxyEntry]) -> dict[str, object]:
 
 async def process_one(line_no: int, line: str, resolver: AsyncDNSCache,
                       settings: Settings) -> ResultItem:
+    if len(line) > MAX_INPUT_LINE:
+        return ResultItem(line_no, line, False, None, "line_too_long")
+
     proxy = parse_proxy(line)
     if proxy is None:
-        return line_no, line, None, "parse"
+        return ResultItem(line_no, line, False, None, "parse")
 
     if settings.resolve and not await resolver.resolve(proxy.host):
-        return line_no, line, None, "dns"
+        return ResultItem(line_no, line, True, None, "dns")
 
     if settings.check_mode != "none" and not await check_proxy(proxy, settings):
         reason = "tcp" if settings.check_mode == "tcp" else "proxy"
-        return line_no, line, None, reason
+        return ResultItem(line_no, line, True, None, reason)
 
-    return line_no, line, proxy, None
+    return ResultItem(line_no, line, True, proxy, None)
 
 
 async def producer(lines: Iterable[tuple[int, str]], queue: asyncio.Queue[WorkItem],
                    workers: int, stats: Stats) -> None:
-    for item in lines:
-        stats.total += 1
-        await queue.put(item)
-    for _ in range(workers):
-        await queue.put(None)
+    try:
+        for item in lines:
+            stats.total += 1
+            await queue.put(item)
+    finally:
+        # Always release workers even if reading the input fails part-way through.
+        for _ in range(workers):
+            await queue.put(None)
 
 
-async def worker(work_queue: asyncio.Queue[WorkItem], result_queue: asyncio.Queue[ResultItem],
+async def worker(work_queue: asyncio.Queue[WorkItem],
+                 result_queue: asyncio.Queue[ResultQueueItem],
                  resolver: AsyncDNSCache, settings: Settings) -> None:
-    while True:
-        item = await work_queue.get()
-        try:
-            if item is None:
-                return
-            await result_queue.put(await process_one(*item, resolver, settings))
-        finally:
-            work_queue.task_done()
+    try:
+        while True:
+            item = await work_queue.get()
+            try:
+                if item is None:
+                    return
+                await result_queue.put(await process_one(*item, resolver, settings))
+            finally:
+                work_queue.task_done()
+    finally:
+        # Completion is explicit; the consumer never has to infer worker state.
+        await result_queue.put(RESULT_WORKER_DONE)
 
 
 def dedupe_proxies(candidates: list[tuple[int, ProxyEntry]], mode: DedupeMode,
@@ -585,7 +633,7 @@ async def generate_config(lines: Iterable[tuple[int, str]], logger: logging.Logg
     stats = Stats()
     resolver = AsyncDNSCache()
     work_queue: asyncio.Queue[WorkItem] = asyncio.Queue(queue_size)
-    result_queue: asyncio.Queue[ResultItem] = asyncio.Queue(queue_size)
+    result_queue: asyncio.Queue[ResultQueueItem] = asyncio.Queue(queue_size)
 
     producer_task = asyncio.create_task(producer(lines, work_queue, concurrency, stats))
     workers = [
@@ -596,27 +644,38 @@ async def generate_config(lines: Iterable[tuple[int, str]], logger: logging.Logg
     candidates: list[tuple[int, ProxyEntry]] = []
     rejected: list[RejectedLine] = []
     processed = 0
+    workers_done = 0
 
     try:
-        while not producer_task.done() or processed < stats.total:
-            line_no, line, proxy, reason = await result_queue.get()
+        while workers_done < concurrency:
+            item = await result_queue.get()
             try:
+                if item is RESULT_WORKER_DONE:
+                    workers_done += 1
+                    continue
+
+                assert isinstance(item, ResultItem)
                 processed += 1
-                if proxy is not None:
+                if item.parsed:
                     stats.parsed += 1
-                    candidates.append((line_no, proxy))
+
+                if item.proxy is not None:
+                    candidates.append((item.line_no, item.proxy))
                 else:
                     stats.invalid += 1
-                    rejected.append(RejectedLine(line_no, reason or "unknown", line))
-                    if reason == "dns":
+                    rejected.append(RejectedLine(item.line_no, item.reason or "unknown", item.line))
+                    if item.reason == "dns":
                         stats.dns_failed += 1
-                    elif reason == "tcp":
+                    elif item.reason == "tcp":
                         stats.tcp_failed += 1
-                    elif reason == "proxy":
+                    elif item.reason == "proxy":
                         stats.proxy_failed += 1
 
                 if progress_every > 0 and processed % progress_every == 0:
-                    logger.info("Processed %d lines (%d accepted so far)", processed, len(candidates))
+                    logger.info(
+                        "Processed %d lines (%d passed validation so far)",
+                        processed, len(candidates),
+                    )
             finally:
                 result_queue.task_done()
 
@@ -630,9 +689,12 @@ async def generate_config(lines: Iterable[tuple[int, str]], logger: logging.Logg
         await asyncio.gather(producer_task, *workers, return_exceptions=True)
         raise
 
-    proxies, stats.duplicates = dedupe_proxies(
-        candidates, dedupe_mode, preserve_order
-    )
+    if processed != stats.total:
+        raise RuntimeError(
+            f"internal pipeline mismatch: produced={stats.total}, processed={processed}"
+        )
+
+    proxies, stats.duplicates = dedupe_proxies(candidates, dedupe_mode, preserve_order)
     stats.valid = len(proxies)
 
     logger.info(
@@ -768,6 +830,15 @@ async def async_main() -> int:
     if args.input.resolve() == args.output.resolve():
         logger.error("Input and output paths must be different")
         return EXIT_FAILURE
+
+    if args.rejected is not None:
+        resolved_rejected = args.rejected.resolve()
+        if resolved_rejected == args.input.resolve():
+            logger.error("Rejected report path must differ from input path")
+            return EXIT_FAILURE
+        if resolved_rejected == args.output.resolve():
+            logger.error("Rejected report path must differ from output path")
+            return EXIT_FAILURE
 
     check_host, check_port = args.check_target
     settings = Settings(
