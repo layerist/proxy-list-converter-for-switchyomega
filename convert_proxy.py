@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Proxy List Converter v3
+Reliable Proxy List Converter v4
 ================================
 
 Converts proxy lists to a SwitchyOmega-compatible JSON configuration.
@@ -16,7 +16,7 @@ Important features:
 - IPv4, IPv6 and IDN host support.
 - Passwords containing ':' are supported.
 - URL-encoded credentials are decoded.
-- Bounded producer/worker queues with deterministic worker shutdown.
+- Bounded producer/worker queues with deadlock-safe cancellation and failure propagation.
 - Coalescing DNS cache: repeated hosts are resolved only once.
 - Optional real proxy handshake check, including authentication.
 - Atomic output writes.
@@ -34,7 +34,6 @@ import ipaddress
 import json
 import logging
 import os
-import signal
 import socket
 import ssl
 import tempfile
@@ -127,8 +126,7 @@ class ResultItem:
     reason: Optional[str]
 
 
-RESULT_WORKER_DONE = object()
-ResultQueueItem = ResultItem | object
+ResultQueueItem = ResultItem
 
 
 def setup_logging(verbose: bool) -> logging.Logger:
@@ -292,7 +290,13 @@ def make_proxy(scheme: str, host: str, raw_port: str | int,
     username = unquote(username.strip())
     password = unquote(password.strip())
 
-    if normalized_host is None or port is None or not username or not password:
+    if (
+        normalized_host is None
+        or port is None
+        or not username
+        or not password
+        or not credentials_are_safe(username, password)
+    ):
         return None
     return ProxyEntry(scheme, normalized_host, port, username, password)
 
@@ -343,6 +347,29 @@ def parse_proxy(line: str) -> Optional[ProxyEntry]:
     return parse_standard_url(line) or parse_legacy_proxy(line)
 
 
+def format_authority(host: str, port: int) -> str:
+    """Return RFC-compatible host:port authority, bracketing IPv6 literals."""
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return f"{host}:{port}"
+    return f"[{host}]:{port}" if parsed.version == 6 else f"{host}:{port}"
+
+
+def credentials_are_safe(username: str, password: str) -> bool:
+    """Reject credentials that could inject protocol delimiters/control bytes."""
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in username + password)
+
+
+async def close_writer(writer: asyncio.StreamWriter | None) -> None:
+    """Best-effort stream shutdown that never masks the original network result."""
+    if writer is None:
+        return
+    writer.close()
+    with contextlib.suppress(OSError, asyncio.TimeoutError, ConnectionError):
+        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+
+
 async def open_proxy_connection(proxy: ProxyEntry, timeout: float):
     ssl_context = None
     server_hostname = None
@@ -369,10 +396,7 @@ async def check_tcp(proxy: ProxyEntry, timeout: float) -> bool:
     except (OSError, asyncio.TimeoutError, ssl.SSLError):
         return False
     finally:
-        if writer is not None:
-            writer.close()
-            with contextlib.suppress(OSError, asyncio.TimeoutError):
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        await close_writer(writer)
 
 
 async def read_http_headers(reader: asyncio.StreamReader, timeout: float) -> bytes:
@@ -408,13 +432,13 @@ async def check_http_proxy(proxy: ProxyEntry, target_host: str,
         credentials = base64.b64encode(
             f"{proxy.username}:{proxy.password}".encode(ENCODING)
         ).decode("ascii")
-        authority = f"{target_host}:{target_port}"
+        authority = format_authority(target_host, target_port)
         request = (
             f"CONNECT {authority} HTTP/1.1\r\n"
             f"Host: {authority}\r\n"
             f"Proxy-Authorization: Basic {credentials}\r\n"
             "Proxy-Connection: close\r\n"
-            "User-Agent: proxy-list-converter/3\r\n\r\n"
+            "User-Agent: proxy-list-converter/4\r\n\r\n"
         ).encode("ascii")
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout)
@@ -425,10 +449,7 @@ async def check_http_proxy(proxy: ProxyEntry, target_host: str,
     except (OSError, asyncio.TimeoutError, ssl.SSLError, ValueError, asyncio.IncompleteReadError):
         return False
     finally:
-        if writer is not None:
-            writer.close()
-            with contextlib.suppress(OSError, asyncio.TimeoutError):
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        await close_writer(writer)
 
 
 async def check_socks5_proxy(proxy: ProxyEntry, target_host: str,
@@ -456,7 +477,10 @@ async def check_socks5_proxy(proxy: ProxyEntry, target_host: str,
         try:
             target_ip = ipaddress.ip_address(target_host)
         except ValueError:
-            encoded_host = target_host.encode("idna")
+            try:
+                encoded_host = target_host.encode("idna")
+            except UnicodeError:
+                return False
             if len(encoded_host) > 255:
                 return False
             address = b"\x03" + bytes([len(encoded_host)]) + encoded_host
@@ -483,10 +507,7 @@ async def check_socks5_proxy(proxy: ProxyEntry, target_host: str,
     except (OSError, asyncio.TimeoutError, ssl.SSLError, asyncio.IncompleteReadError):
         return False
     finally:
-        if writer is not None:
-            writer.close()
-            with contextlib.suppress(OSError, asyncio.TimeoutError):
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        await close_writer(writer)
 
 
 async def check_proxy(proxy: ProxyEntry, settings: Settings) -> bool:
@@ -593,18 +614,15 @@ async def producer(lines: Iterable[tuple[int, str]], queue: asyncio.Queue[WorkIt
 async def worker(work_queue: asyncio.Queue[WorkItem],
                  result_queue: asyncio.Queue[ResultQueueItem],
                  resolver: AsyncDNSCache, settings: Settings) -> None:
-    try:
-        while True:
-            item = await work_queue.get()
-            try:
-                if item is None:
-                    return
-                await result_queue.put(await process_one(*item, resolver, settings))
-            finally:
-                work_queue.task_done()
-    finally:
-        # Completion is explicit; the consumer never has to infer worker state.
-        await result_queue.put(RESULT_WORKER_DONE)
+    while True:
+        item = await work_queue.get()
+        try:
+            if item is None:
+                return
+            result = await process_one(*item, resolver, settings)
+            await result_queue.put(result)
+        finally:
+            work_queue.task_done()
 
 
 def dedupe_proxies(candidates: list[tuple[int, ProxyEntry]], mode: DedupeMode,
@@ -635,53 +653,99 @@ async def generate_config(lines: Iterable[tuple[int, str]], logger: logging.Logg
     work_queue: asyncio.Queue[WorkItem] = asyncio.Queue(queue_size)
     result_queue: asyncio.Queue[ResultQueueItem] = asyncio.Queue(queue_size)
 
-    producer_task = asyncio.create_task(producer(lines, work_queue, concurrency, stats))
+    producer_task = asyncio.create_task(
+        producer(lines, work_queue, concurrency, stats), name="producer"
+    )
     workers = [
-        asyncio.create_task(worker(work_queue, result_queue, resolver, settings))
-        for _ in range(concurrency)
+        asyncio.create_task(
+            worker(work_queue, result_queue, resolver, settings),
+            name=f"worker-{index + 1}",
+        )
+        for index in range(concurrency)
     ]
 
     candidates: list[tuple[int, ProxyEntry]] = []
     rejected: list[RejectedLine] = []
     processed = 0
-    workers_done = 0
 
     try:
-        while workers_done < concurrency:
-            item = await result_queue.get()
-            try:
-                if item is RESULT_WORKER_DONE:
-                    workers_done += 1
-                    continue
+        # Consume results while either input production or workers are still active.
+        # A timeout-free asyncio.wait avoids sentinel deadlocks during cancellation.
+        while True:
+            if producer_task.done() and all(task.done() for task in workers):
+                while not result_queue.empty():
+                    item = result_queue.get_nowait()
+                    try:
+                        processed += 1
+                        if item.parsed:
+                            stats.parsed += 1
+                        if item.proxy is not None:
+                            candidates.append((item.line_no, item.proxy))
+                        else:
+                            stats.invalid += 1
+                            rejected.append(RejectedLine(item.line_no, item.reason or "unknown", item.line))
+                            if item.reason == "dns":
+                                stats.dns_failed += 1
+                            elif item.reason == "tcp":
+                                stats.tcp_failed += 1
+                            elif item.reason == "proxy":
+                                stats.proxy_failed += 1
+                    finally:
+                        result_queue.task_done()
+                break
 
-                assert isinstance(item, ResultItem)
-                processed += 1
-                if item.parsed:
-                    stats.parsed += 1
+            get_task = asyncio.create_task(result_queue.get())
+            watched: set[asyncio.Task[object]] = {get_task}
+            if not producer_task.done():
+                watched.add(producer_task)  # type: ignore[arg-type]
+            watched.update(task for task in workers if not task.done())  # type: ignore[arg-type]
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
 
-                if item.proxy is not None:
-                    candidates.append((item.line_no, item.proxy))
-                else:
-                    stats.invalid += 1
-                    rejected.append(RejectedLine(item.line_no, item.reason or "unknown", item.line))
-                    if item.reason == "dns":
-                        stats.dns_failed += 1
-                    elif item.reason == "tcp":
-                        stats.tcp_failed += 1
-                    elif item.reason == "proxy":
-                        stats.proxy_failed += 1
+            if get_task in done:
+                item = get_task.result()
+                try:
+                    processed += 1
+                    if item.parsed:
+                        stats.parsed += 1
+                    if item.proxy is not None:
+                        candidates.append((item.line_no, item.proxy))
+                    else:
+                        stats.invalid += 1
+                        rejected.append(RejectedLine(item.line_no, item.reason or "unknown", item.line))
+                        if item.reason == "dns":
+                            stats.dns_failed += 1
+                        elif item.reason == "tcp":
+                            stats.tcp_failed += 1
+                        elif item.reason == "proxy":
+                            stats.proxy_failed += 1
 
-                if progress_every > 0 and processed % progress_every == 0:
-                    logger.info(
-                        "Processed %d lines (%d passed validation so far)",
-                        processed, len(candidates),
-                    )
-            finally:
-                result_queue.task_done()
+                    if progress_every > 0 and processed % progress_every == 0:
+                        logger.info(
+                            "Processed %d lines (%d passed validation so far)",
+                            processed, len(candidates),
+                        )
+                finally:
+                    result_queue.task_done()
+            else:
+                get_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await get_task
+
+            # Propagate producer/worker exceptions immediately instead of hanging.
+            if producer_task.done() and not producer_task.cancelled():
+                exc = producer_task.exception()
+                if exc is not None:
+                    raise exc
+            for task in workers:
+                if task.done() and not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
 
         await producer_task
         await work_queue.join()
         await asyncio.gather(*workers)
+        await result_queue.join()
     except BaseException:
         producer_task.cancel()
         for task in workers:
@@ -803,27 +867,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def install_signal_handlers(logger: logging.Logger) -> None:
-    loop = asyncio.get_running_loop()
-
-    def interrupt() -> None:
-        logger.warning("Interrupted")
-        for task in asyncio.all_tasks(loop):
-            if task is not asyncio.current_task(loop):
-                task.cancel()
-
-    for signame in ("SIGINT", "SIGTERM"):
-        signum = getattr(signal, signame, None)
-        if signum is not None:
-            with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(signum, interrupt)
-
-
 async def async_main() -> int:
     args = build_arg_parser().parse_args()
     logger = setup_logging(args.verbose)
-    install_signal_handlers(logger)
-
     if not args.input.is_file():
         logger.error("Input file not found or not a regular file: %s", args.input)
         return EXIT_FAILURE
