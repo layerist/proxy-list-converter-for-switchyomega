@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Proxy List Converter v4
+Reliable Proxy List Converter v5
 ================================
 
 Converts proxy lists to a SwitchyOmega-compatible JSON configuration.
@@ -33,6 +33,7 @@ import contextlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import socket
 import ssl
@@ -60,6 +61,8 @@ BYPASS_PATTERNS = ("127.0.0.1", "::1", "localhost")
 
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_CONCURRENCY = 100
+MAX_CONCURRENCY = 4096
+MAX_QUEUE_SIZE = 1_000_000
 DEFAULT_QUEUE_MULTIPLIER = 4
 DEFAULT_PROGRESS_EVERY = 1000
 DEFAULT_CHECK_TARGET = "example.com:443"
@@ -166,6 +169,9 @@ def _atomic_text_writer(destination: Path):
             file.flush()
             os.fsync(file.fileno())
         os.replace(tmp_name, destination)
+        # Output may contain proxy credentials; keep newly written files private.
+        with contextlib.suppress(OSError):
+            os.chmod(destination, 0o600)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
@@ -230,7 +236,7 @@ class AsyncDNSCache:
         self._inflight: dict[str, asyncio.Task[bool]] = {}
         self._lock = asyncio.Lock()
 
-    async def resolve(self, host: str) -> bool:
+    async def resolve(self, host: str, timeout: float) -> bool:
         try:
             ipaddress.ip_address(host)
             return True
@@ -247,15 +253,21 @@ class AsyncDNSCache:
                 self._inflight[host] = task
 
         try:
-            result = await asyncio.shield(task)
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            # getaddrinfo() runs in a thread and cannot be force-cancelled safely.
+            # Keep the shared lookup alive for other/future waiters, but do not let
+            # one pathological resolver stall this worker indefinitely.
+            return False
         except Exception:
             result = False
 
         async with self._lock:
             self._cache[host] = result
-            self._inflight.pop(host, None)
+            if self._inflight.get(host) is task:
+                self._inflight.pop(host, None)
         return result
 
     @staticmethod
@@ -438,7 +450,7 @@ async def check_http_proxy(proxy: ProxyEntry, target_host: str,
             f"Host: {authority}\r\n"
             f"Proxy-Authorization: Basic {credentials}\r\n"
             "Proxy-Connection: close\r\n"
-            "User-Agent: proxy-list-converter/4\r\n\r\n"
+            "User-Agent: proxy-list-converter/5\r\n\r\n"
         ).encode("ascii")
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout)
@@ -589,7 +601,7 @@ async def process_one(line_no: int, line: str, resolver: AsyncDNSCache,
     if proxy is None:
         return ResultItem(line_no, line, False, None, "parse")
 
-    if settings.resolve and not await resolver.resolve(proxy.host):
+    if settings.resolve and not await resolver.resolve(proxy.host, settings.timeout):
         return ResultItem(line_no, line, True, None, "dns")
 
     if settings.check_mode != "none" and not await check_proxy(proxy, settings):
@@ -794,8 +806,8 @@ def positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 0")
     return parsed
 
 
@@ -806,6 +818,20 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def concurrency_int(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > MAX_CONCURRENCY:
+        raise argparse.ArgumentTypeError(f"must be <= {MAX_CONCURRENCY}")
+    return parsed
+
+
+def queue_size_int(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > MAX_QUEUE_SIZE:
+        raise argparse.ArgumentTypeError(f"must be <= {MAX_QUEUE_SIZE}")
     return parsed
 
 
@@ -839,12 +865,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Timeout per network operation (default: {DEFAULT_TIMEOUT})",
     )
     parser.add_argument(
-        "--threads", "--concurrency", dest="concurrency", type=positive_int,
+        "--threads", "--concurrency", dest="concurrency", type=concurrency_int,
         default=DEFAULT_CONCURRENCY,
         help=f"Concurrent workers (default: {DEFAULT_CONCURRENCY})",
     )
     parser.add_argument(
-        "--queue-size", type=positive_int, default=None,
+        "--queue-size", type=queue_size_int, default=None,
         help="Bounded input/result queue size (default: concurrency * 4)",
     )
     parser.add_argument(
